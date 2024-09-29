@@ -1,12 +1,20 @@
 import React, { useState, useEffect } from 'react';
 import { extractAndStoreEvent } from '../lib/extractor';
 import { saveEventsToDatabase } from '../lib/database';
+import { extractEventUrl } from '../lib/urlExtractor'; // We'll create this new file
 
 type EventRow = {
   url: string;
   status: 'not_started' | 'in_progress' | 'done' | 'sent_to_db' | 'failed';
   data: any;
+  markdown: string;
   checked: boolean;
+};
+
+type ExtractedUrl = {
+  originalUrl: string;
+  extractedUrl: string;
+  status: 'Uploaded' | 'Extracted' | 'Sent to EDE' | 'Failed';
 };
 
 // Add this helper function at the top of your file, outside the component
@@ -30,6 +38,8 @@ export default function EventSpreadsheet() {
   const [rows, setRows] = useState<EventRow[]>([]);
   const [allChecked, setAllChecked] = useState(false);
   const [isExtracting, setIsExtracting] = useState(false);
+  const [activeTab, setActiveTab] = useState<'eventSpreadsheet' | 'urlExtractor'>('eventSpreadsheet');
+  const [extractedUrls, setExtractedUrls] = useState<ExtractedUrl[]>([]);
 
   const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -47,6 +57,7 @@ export default function EventSpreadsheet() {
           url, 
           status: 'not_started', 
           data: null, 
+          markdown: '', 
           checked: false 
         })));
       };
@@ -78,7 +89,12 @@ export default function EventSpreadsheet() {
             
             setRows(prev => {
               const newRows = prev.map((row, index) => 
-                index === i ? { ...row, status: 'done' as const, data: extractedData } : row
+                index === i ? { 
+                  ...row, 
+                  status: 'done' as const, 
+                  data: extractedData.event, 
+                  markdown: extractedData.markdown 
+                } : row
               );
               console.log('Updated row:', JSON.stringify(newRows[i], null, 2));
               return newRows;
@@ -133,90 +149,339 @@ export default function EventSpreadsheet() {
     setAllChecked(false);
   };
 
+  const pushAllToSupabase = async () => {
+    const rowsToPush = rows.filter(row => row.checked && row.status === 'done');
+    if (rowsToPush.length === 0) {
+      alert('No checked rows with "Done Extracting" status to push to Supabase.');
+      return;
+    }
+
+    try {
+      const eventsToSave = rowsToPush.map(row => ({
+        ...row.data,
+        url: row.url,
+        event_markdown: row.markdown
+      }));
+
+      await saveEventsToDatabase(eventsToSave);
+      
+      setRows(prev => prev.map(row => 
+        row.checked && row.status === 'done' ? { ...row, status: 'sent_to_db' } : row
+      ));
+
+      alert(`${rowsToPush.length} checked and extracted row(s) have been pushed to Supabase successfully!`);
+    } catch (error) {
+      console.error('Error pushing data to Supabase:', error);
+      alert('Failed to push data to Supabase. Please check the console for more details.');
+    }
+  };
+
+  const downloadCSV = () => {
+    const extractedRows = rows.filter(row => row.status === 'done' || row.status === 'sent_to_db');
+    if (extractedRows.length === 0) {
+      alert('No extracted data to download.');
+      return;
+    }
+
+    const headers = [
+      'URL', 'Name', 'Description', 'Start Date', 'End Date', 'City', 'State', 'Country',
+      'Attendee Count', 'Topics', 'Event Type', 'Attendee Title', 'Logo URL',
+      'Sponsorship Options', 'Agenda', 'Audience Insights', 'Sponsors',
+      'Hosting Company', 'Ticket Cost', 'Contact Email'
+    ];
+
+    const csvContent = [
+      headers.join(','),
+      ...extractedRows.map(row => [
+        row.url,
+        row.data.name,
+        `"${(row.data.description || '').replace(/"/g, '""')}"`,
+        row.data.start_date,
+        row.data.end_date,
+        row.data.city,
+        row.data.state,
+        row.data.country,
+        row.data.attendee_count,
+        `"${(row.data.topics || []).join(', ')}"`,
+        row.data.event_type,
+        row.data.attendee_title,
+        row.data.logo_url,
+        `"${JSON.stringify(row.data.sponsorship_options).replace(/"/g, '""')}"`,
+        `"${JSON.stringify(row.data.agenda).replace(/"/g, '""')}"`,
+        `"${JSON.stringify(row.data.audience_insights).replace(/"/g, '""')}"`,
+        `"${JSON.stringify(row.data.sponsors).replace(/"/g, '""')}"`,
+        `"${JSON.stringify(row.data.hosting_company).replace(/"/g, '""')}"`,
+        row.data.ticket_cost,
+        row.data.contact_email
+      ].join(','))
+    ].join('\n');
+
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    if (link.download !== undefined) {
+      const url = URL.createObjectURL(blob);
+      link.setAttribute('href', url);
+      link.setAttribute('download', 'extracted_events.csv');
+      link.style.visibility = 'hidden';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    }
+  };
+
   const checkedNotStartedCount = rows.filter(row => row.checked && row.status === 'not_started').length;
+
+  const handleUrlFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const content = e.target?.result as string;
+        const urls = content.split('\n').filter(url => url.trim() !== '');
+        setExtractedUrls(urls.map(url => ({ originalUrl: url, extractedUrl: '', status: 'Uploaded' })));
+      };
+      reader.readAsText(file);
+    }
+  };
+
+  const extractUrls = async () => {
+    setIsExtracting(true);
+    const updatedUrls = [...extractedUrls];
+
+    for (let i = 0; i < updatedUrls.length; i++) {
+      if (updatedUrls[i].status === 'Uploaded') {
+        try {
+          const extractedUrl = await extractEventUrl(updatedUrls[i].originalUrl);
+          updatedUrls[i] = { ...updatedUrls[i], extractedUrl, status: 'Extracted' };
+        } catch (error) {
+          console.error(`Failed to extract URL for ${updatedUrls[i].originalUrl}:`, error);
+          updatedUrls[i] = { ...updatedUrls[i], extractedUrl: '', status: 'Failed' };
+        }
+      }
+    }
+
+    setExtractedUrls(updatedUrls);
+    setIsExtracting(false);
+  };
+
+  const copyToEventSpreadsheet = () => {
+    const successfulUrls = extractedUrls
+      .filter(url => url.status === 'Extracted')
+      .map(url => url.extractedUrl);
+    setRows(successfulUrls.map(url => ({ 
+      url, 
+      status: 'not_started', 
+      data: null, 
+      markdown: '', 
+      checked: false 
+    })));
+    setExtractedUrls(prevUrls => prevUrls.map(url => 
+      url.status === 'Extracted' ? { ...url, status: 'Sent to EDE' } : url
+    ));
+    setActiveTab('eventSpreadsheet');
+  };
+
+  const exportExtractedUrlsToCsv = () => {
+    const csvContent = [
+      ['Original URL', 'Extracted URL', 'Status'].join(','),
+      ...extractedUrls.map(url => [
+        url.originalUrl,
+        url.extractedUrl,
+        url.status
+      ].join(','))
+    ].join('\n');
+
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    if (link.download !== undefined) {
+      const url = URL.createObjectURL(blob);
+      link.setAttribute('href', url);
+      link.setAttribute('download', 'extracted_urls.csv');
+      link.style.visibility = 'hidden';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    }
+  };
 
   return (
     <div className="container mx-auto p-4">
-      <input type="file" accept=".csv" onChange={handleFileUpload} className="mb-4" />
-      <button 
-        onClick={extractData} 
-        className="bg-blue-500 text-white px-4 py-2 rounded mr-2" 
-        disabled={isExtracting || checkedNotStartedCount === 0}
-      >
-        {isExtracting ? 'Extracting...' : `Extract Data (${checkedNotStartedCount})`}
-      </button>
-      <button onClick={saveCheckedRows} className="bg-green-500 text-white px-4 py-2 rounded mr-2">Save Checked Rows</button>
-      <button onClick={toggleAllChecked} className="bg-gray-500 text-white px-4 py-2 rounded mr-2">
-        {allChecked ? 'Uncheck All' : 'Check All'}
-      </button>
-      <button onClick={clearAll} className="bg-red-500 text-white px-4 py-2 rounded">Clear All</button>
-      
-      <div className="overflow-x-auto">
-        <table className="min-w-full bg-white border border-gray-300 mt-4">
-          <thead>
-            <tr className="bg-gray-100">
-              <th className="border-b p-2 text-left text-gray-800">Check</th>
-              <th className="border-b p-2 text-left text-gray-800">Status</th>
-              <th className="border-b p-2 text-left text-gray-800">URL</th>
-              <th className="border-b p-2 text-left text-gray-800">Name</th>
-              <th className="border-b p-2 text-left text-gray-800">Description</th>
-              <th className="border-b p-2 text-left text-gray-800">Start Date</th>
-              <th className="border-b p-2 text-left text-gray-800">End Date</th>
-              <th className="border-b p-2 text-left text-gray-800">City</th>
-              <th className="border-b p-2 text-left text-gray-800">State</th>
-              <th className="border-b p-2 text-left text-gray-800">Country</th>
-              <th className="border-b p-2 text-left text-gray-800">Attendee Count</th>
-              <th className="border-b p-2 text-left text-gray-800">Topics</th>
-              <th className="border-b p-2 text-left text-gray-800">Event Type</th>
-              <th className="border-b p-2 text-left text-gray-800">Attendee Title</th>
-              <th className="border-b p-2 text-left text-gray-800">Logo URL</th>
-              <th className="border-b p-2 text-left text-gray-800">Sponsorship Options</th>
-              <th className="border-b p-2 text-left text-gray-800">Agenda</th>
-              <th className="border-b p-2 text-left text-gray-800">Audience Insights</th>
-              <th className="border-b p-2 text-left text-gray-800">Sponsors</th>
-              <th className="border-b p-2 text-left text-gray-800">Hosting Company</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((row, index) => (
-              <tr key={index} className="hover:bg-gray-50">
-                <td className="border-b p-2">
-                  <input 
-                    type="checkbox" 
-                    checked={row.checked} 
-                    onChange={() => toggleRowChecked(index)}
-                  />
-                </td>
-                <td className="border-b p-2 text-gray-800">
-                  {row.status === 'not_started' && <span className="text-gray-500">Not Started</span>}
-                  {row.status === 'in_progress' && <span className="text-blue-500">In Progress</span>}
-                  {row.status === 'done' && <span className="text-green-500">Done Extracting</span>}
-                  {row.status === 'sent_to_db' && <span className="text-purple-500">Sent to Database</span>}
-                  {row.status === 'failed' && <span className="text-red-500">Failed</span>}
-                </td>
-                <td className="border-b p-2 text-gray-800">{row.url}</td>
-                <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.name)}</td>
-                <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.description)}</td>
-                <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.start_date)}</td>
-                <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.end_date)}</td>
-                <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.city)}</td>
-                <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.state)}</td>
-                <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.country)}</td>
-                <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.attendee_count)}</td>
-                <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.topics_or_themes)}</td>
-                <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.event_type)}</td>
-                <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.typical_attendee_titles_or_roles)}</td>
-                <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.logo_url)}</td>
-                <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.sponsorship_options)}</td>
-                <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.event_agenda_or_schedule)}</td>
-                <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.audience_insights_or_demographics)}</td>
-                <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.sponsoring_companies)}</td>
-                <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.hosting_company_or_organization)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+      <div className="mb-4">
+        <button 
+          onClick={() => setActiveTab('eventSpreadsheet')} 
+          className={`px-4 py-2 mr-2 ${activeTab === 'eventSpreadsheet' ? 'bg-blue-500 text-white' : 'bg-gray-200'}`}
+        >
+          Event Spreadsheet
+        </button>
+        <button 
+          onClick={() => setActiveTab('urlExtractor')} 
+          className={`px-4 py-2 ${activeTab === 'urlExtractor' ? 'bg-blue-500 text-white' : 'bg-gray-200'}`}
+        >
+          URL Extractor
+        </button>
       </div>
+
+      {activeTab === 'eventSpreadsheet' ? (
+        <div>
+          <input type="file" accept=".csv" onChange={handleFileUpload} className="mb-4" />
+          <button 
+            onClick={extractData} 
+            className="bg-blue-500 text-white px-4 py-2 rounded mr-2" 
+            disabled={isExtracting || checkedNotStartedCount === 0}
+          >
+            {isExtracting ? 'Extracting...' : `Extract Data (${checkedNotStartedCount})`}
+          </button>
+          <button onClick={saveCheckedRows} className="bg-green-500 text-white px-4 py-2 rounded mr-2">Save Checked Rows</button>
+          <button onClick={toggleAllChecked} className="bg-gray-500 text-white px-4 py-2 rounded mr-2">
+            {allChecked ? 'Uncheck All' : 'Check All'}
+          </button>
+          <button onClick={clearAll} className="bg-red-500 text-white px-4 py-2 rounded mr-2">Clear All</button>
+          <button 
+            onClick={pushAllToSupabase} 
+            className="bg-purple-500 text-white px-4 py-2 rounded mr-2"
+          >
+            Push All to Supabase
+          </button>
+          <button 
+            onClick={downloadCSV} 
+            className="bg-yellow-500 text-white px-4 py-2 rounded"
+          >
+            Download CSV
+          </button>
+          
+          <div className="overflow-x-auto">
+            <table className="min-w-full bg-white border border-gray-300 mt-4">
+              <thead>
+                <tr className="bg-gray-100">
+                  <th className="border-b p-2 text-left text-gray-800">Check</th>
+                  <th className="border-b p-2 text-left text-gray-800">Status</th>
+                  <th className="border-b p-2 text-left text-gray-800">URL</th>
+                  <th className="border-b p-2 text-left text-gray-800">Name</th>
+                  <th className="border-b p-2 text-left text-gray-800">Description</th>
+                  <th className="border-b p-2 text-left text-gray-800">Start Date</th>
+                  <th className="border-b p-2 text-left text-gray-800">End Date</th>
+                  <th className="border-b p-2 text-left text-gray-800">City</th>
+                  <th className="border-b p-2 text-left text-gray-800">State</th>
+                  <th className="border-b p-2 text-left text-gray-800">Country</th>
+                  <th className="border-b p-2 text-left text-gray-800">Attendee Count</th>
+                  <th className="border-b p-2 text-left text-gray-800">Topics</th>
+                  <th className="border-b p-2 text-left text-gray-800">Event Type</th>
+                  <th className="border-b p-2 text-left text-gray-800">Attendee Title</th>
+                  <th className="border-b p-2 text-left text-gray-800">Logo URL</th>
+                  <th className="border-b p-2 text-left text-gray-800">Sponsorship Options</th>
+                  <th className="border-b p-2 text-left text-gray-800">Agenda</th>
+                  <th className="border-b p-2 text-left text-gray-800">Audience Insights</th>
+                  <th className="border-b p-2 text-left text-gray-800">Sponsors</th>
+                  <th className="border-b p-2 text-left text-gray-800">Hosting Company</th>
+                  <th className="border-b p-2 text-left text-gray-800">Ticket Cost</th>
+                  <th className="border-b p-2 text-left text-gray-800">Contact Email</th>
+                  <th className="border-b p-2 text-left text-gray-800">Markdown</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((row, index) => (
+                  <tr key={index} className="hover:bg-gray-50">
+                    <td className="border-b p-2">
+                      <input 
+                        type="checkbox" 
+                        checked={row.checked} 
+                        onChange={() => toggleRowChecked(index)}
+                      />
+                    </td>
+                    <td className="border-b p-2 text-gray-800">
+                      {row.status === 'not_started' && <span className="text-gray-500">Not Started</span>}
+                      {row.status === 'in_progress' && <span className="text-blue-500">In Progress</span>}
+                      {row.status === 'done' && <span className="text-green-500">Done Extracting</span>}
+                      {row.status === 'sent_to_db' && <span className="text-purple-500">Sent to Database</span>}
+                      {row.status === 'failed' && <span className="text-red-500">Failed</span>}
+                    </td>
+                    <td className="border-b p-2 text-gray-800">{row.url}</td>
+                    <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.name)}</td>
+                    <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.description)}</td>
+                    <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.start_date)}</td>
+                    <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.end_date)}</td>
+                    <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.city)}</td>
+                    <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.state)}</td>
+                    <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.country)}</td>
+                    <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.attendee_count)}</td>
+                    <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.topics)}</td>
+                    <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.event_type)}</td>
+                    <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.attendee_title)}</td>
+                    <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.logo_url)}</td>
+                    <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.sponsorship_options)}</td>
+                    <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.agenda)}</td>
+                    <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.audience_insights)}</td>
+                    <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.sponsors)}</td>
+                    <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.hosting_company)}</td>
+                    <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.ticket_cost)}</td>
+                    <td className="border-b p-2 text-gray-800">{renderCellContent(row.data?.contact_email)}</td>
+                    <td className="border-b p-2 text-gray-800">
+                      <div className="max-h-40 overflow-y-auto">
+                        <pre className="whitespace-pre-wrap">{row.markdown}</pre>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      ) : (
+        <div>
+          <input type="file" accept=".csv" onChange={handleUrlFileUpload} className="mb-4" />
+          <button 
+            onClick={extractUrls} 
+            className="bg-blue-500 text-white px-4 py-2 rounded mr-2" 
+            disabled={isExtracting || extractedUrls.filter(url => url.status === 'Uploaded').length === 0}
+          >
+            {isExtracting ? 'Extracting...' : 'Extract URLs'}
+          </button>
+          <button 
+            onClick={copyToEventSpreadsheet} 
+            className="bg-green-500 text-white px-4 py-2 rounded mr-2" 
+            disabled={extractedUrls.filter(url => url.status === 'Extracted').length === 0}
+          >
+            Copy to Event Spreadsheet
+          </button>
+          <button 
+            onClick={exportExtractedUrlsToCsv} 
+            className="bg-yellow-500 text-white px-4 py-2 rounded" 
+            disabled={extractedUrls.length === 0}
+          >
+            Export to CSV
+          </button>
+
+          <div className="overflow-x-auto mt-4">
+            <table className="min-w-full bg-white border border-gray-300">
+              <thead>
+                <tr className="bg-gray-100">
+                  <th className="border-b p-2 text-left">Original URL</th>
+                  <th className="border-b p-2 text-left">Extracted URL</th>
+                  <th className="border-b p-2 text-left">Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {extractedUrls.map((url, index) => (
+                  <tr key={index} className="hover:bg-gray-50">
+                    <td className="border-b p-2">{url.originalUrl}</td>
+                    <td className="border-b p-2">{url.extractedUrl}</td>
+                    <td className="border-b p-2">
+                      <span className={`
+                        ${url.status === 'Uploaded' ? 'text-gray-500' : ''}
+                        ${url.status === 'Extracted' ? 'text-green-500' : ''}
+                        ${url.status === 'Sent to EDE' ? 'text-blue-500' : ''}
+                        ${url.status === 'Failed' ? 'text-red-500' : ''}
+                      `}>
+                        {url.status}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

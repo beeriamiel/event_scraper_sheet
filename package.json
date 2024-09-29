@@ -11,11 +11,14 @@
   "dependencies": {
     "@mendable/firecrawl-js": "^1.5.2",
     "@supabase/supabase-js": "^2.45.4",
+    "firecrawl": "^1.5.2",
+    "jsdom": "^25.0.1",
     "next": "14.2.13",
     "react": "^18",
     "react-dom": "^18"
   },
   "devDependencies": {
+    "@types/jsdom": "^21.1.7",
     "@types/node": "^20",
     "@types/react": "^18",
     "@types/react-dom": "^18",
