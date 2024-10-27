@@ -567,11 +567,17 @@ video {
 .mb-6 {
   margin-bottom: 1.5rem;
 }
+.ml-2 {
+  margin-left: 0.5rem;
+}
 .mr-2 {
   margin-right: 0.5rem;
 }
 .mt-4 {
   margin-top: 1rem;
+}
+.flex {
+  display: flex;
 }
 .table {
   display: table;
@@ -590,6 +596,9 @@ video {
 }
 .max-w-7xl {
   max-width: 80rem;
+}
+.justify-center {
+  justify-content: center;
 }
 .overflow-x-auto {
   overflow-x: auto;

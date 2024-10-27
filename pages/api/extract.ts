@@ -2,16 +2,41 @@ import type { NextApiRequest, NextApiResponse } from 'next';
 import axios from 'axios';
 import { isAxiosError } from 'axios';
 
+// Add this function to validate and correct URLs
+function validateAndCorrectUrl(url: string): string {
+  try {
+    const parsedUrl = new URL(url);
+    // Check if the hostname has at least two parts (domain and TLD)
+    const hostnameParts = parsedUrl.hostname.split('.');
+    if (hostnameParts.length < 2) {
+      // If not, assume it's missing the www subdomain
+      parsedUrl.hostname = `www.${parsedUrl.hostname}`;
+    }
+    return parsedUrl.toString();
+  } catch (error) {
+    // If URL parsing fails, try prepending 'https://'
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+      return validateAndCorrectUrl(`https://${url}`);
+    }
+    // If it still fails, return the original URL
+    return url;
+  }
+}
+
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   console.log('Firecrawl API Key:', process.env.FIRECRAWL_API_KEY ? 'Set' : 'Not set');
 
   if (req.method === 'POST') {
     console.log('Received POST request:', req.body);
     try {
-      const { url } = req.body;
+      let { url } = req.body;
       if (!url) {
         throw new Error('URL is required');
       }
+
+      // Validate and correct the URL
+      url = validateAndCorrectUrl(url);
+      console.log('Validated URL:', url);
 
       console.log('Attempting to connect to Firecrawl API...');
       
@@ -29,62 +54,45 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
               city: { type: "string" },
               state: { type: "string" },
               country: { type: "string" },
-              attendee_count: { type: "string" }, // Changed to string type
-              topics: { type: ["array", "string", "null"], items: { type: "string" } },
+              attendee_count: { type: "string" },
+              topics: { type: "string" },
               event_type: { type: "string" },
-              attendee_title: { 
-                type: ["string", "array"],
-                items: { type: "string" }
-              },
+              attendee_title: { type: "string" },
               logo_url: { type: "string" },
-              sponsorship_options: { type: ["string", "object", "null"] },
-              agenda: { type: ["string", "object", "null"] },
-              audience_insights: { type: ["string", "object", "null"] },
-              sponsors: { 
-                type: ["array", "object", "string", "null"],
-                items: { type: "string" }
-              },
-              hosting_company: { type: ["string", "object", "null"] },
-              ticket_cost: { type: ["string", "null"] },
-              contact_email: { type: ["string", "null"] }
+              sponsorship_options: { type: "string" },
+              agenda: { type: "string" },
+              audience_insights: { type: "string" },
+              sponsors: { type: "string" },
+              hosting_company: { type: "string" },
+              ticket_cost: { type: "string" },
+              contact_email: { type: "string" }
             },
-            required: ["name"]
+            required: ["name"],
+            additionalProperties: true
           },
-          prompt: `Extract detailed event information including:
-            - name
-            - description
-            - start date
-            - end date
-            - city
-            - state (full state name)
-            - country
-            - estimate of attendee count, must be one of these exact strings: 
-              - 0-100
-              - 100-500
-              - 500-1000
-              - 1000-5000
-              - 5000-10000
-              - 10000+
-            - topics or themes that will be discussed at conference
-            - event type: choose between: conference, workshop, roundtable
-            - titles of attendees attending event - must pick between, and can pick more than one:
-                -C-Suite
-                -Director
-                -Vice President
-                -Manager
-                -Engineer 
-                -Analyst
-                -Researcher
-            - logo URL
-            - sponsorship options (not ticket prices)
-            - event agenda or schedule
-            - demographics of attendees
-            - list of companies who are sponsoring the event, also called partners or exhibitors (company names only)
-            - hosting company or organization
-            - contact email
-            - cost of ticket to attend
-            Provide as much detail as possible for each field. Don't make anything up. Use information that you extracted only.
-            If you don't know what something is, leave it blank or null.`
+          prompt: `Extract detailed event information. For each field, provide the information as a simple string. If a field contains multiple items, separate them with commas. If information is not available, use "N/A". Fields to extract:
+
+            - name: Event name
+            - description: Brief description of the event
+            - start_date: Start date of the event, must be formatted as YYYY-MM-DD
+            - end_date: End date of the event, must be formatted as YYYY-MM-DD
+            - city: City where the event is held
+            - state: Full state name where the event is held
+            - country: Country where the event is held
+            - attendee_count: Estimated number of attendees (use one of these: 0-100, 100-500, 500-1000, 1000-5000, 5000-10000, 10000+, or N/A if not specified)
+            - topics: Main topics or themes of the conference (comma-separated)
+            - event_type: Type of event (conference, workshop, or roundtable)
+            - attendee_title: Titles of attendees (comma-separated, choose from: C-Suite, Director, Vice President, Manager, Engineer, Analyst, Researcher)
+            - logo_url: URL of the event logo
+            - sponsorship_options: Available sponsorship options (brief summary)
+            - agenda: Brief summary of the event agenda or schedule
+            - audience_insights: Brief description of attendee demographics
+            - sponsors: List of sponsoring companies (comma-separated)
+            - hosting_company: Name of the company or organization hosting the event
+            - ticket_cost: Cost of attending the event
+            - contact_email: Contact email for the event
+
+            Provide as much accurate information as possible based on the event webpage. Do not invent or assume any information. If a piece of information is not available, use "N/A".`
         }
       }, {
         headers: {
@@ -94,19 +102,31 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         timeout: 55000
       });
 
-      // Add a check for the response structure
-      if (!firecrawlResponse.data || !firecrawlResponse.data.data) {
-        throw new Error('Unexpected response structure from Firecrawl API');
-      }
-
       console.log('Firecrawl API response received');
       console.log('Firecrawl API response status:', firecrawlResponse.status);
       console.log('Firecrawl API response data:', JSON.stringify(firecrawlResponse.data, null, 2));
 
-      // Ensure we're sending both the extracted data and markdown
+      let extractedData, markdown;
+
+      if (firecrawlResponse.data && firecrawlResponse.data.data) {
+        extractedData = firecrawlResponse.data.data.extract;
+        markdown = firecrawlResponse.data.data.markdown;
+      } else if (firecrawlResponse.data && firecrawlResponse.data.extract) {
+        extractedData = firecrawlResponse.data.extract;
+        markdown = firecrawlResponse.data.markdown || '';
+      } else {
+        throw new Error('Unexpected response structure from Firecrawl API');
+      }
+
+      // Ensure all fields are strings and handle potential null/undefined values
+      const sanitizedData = Object.entries(extractedData).reduce((acc, [key, value]) => {
+        acc[key] = value != null ? String(value) : 'N/A';
+        return acc;
+      }, {} as Record<string, string>);
+
       res.status(200).json({ 
-        event: firecrawlResponse.data.data.extract,
-        markdown: firecrawlResponse.data.data.markdown
+        event: sanitizedData,
+        markdown: markdown
       });
     } catch (error: any) {
       console.error('Error in API handler:', error);
@@ -133,9 +153,14 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         };
       } else if (error instanceof Error) {
         errorMessage = error.message;
+        errorDetails = {
+          name: error.name,
+          stack: error.stack
+        };
       }
 
-      res.status(500).json({ 
+      // Instead of sending a 500 status, send a 200 status with error information
+      res.status(200).json({ 
         error: errorMessage,
         details: errorDetails
       });

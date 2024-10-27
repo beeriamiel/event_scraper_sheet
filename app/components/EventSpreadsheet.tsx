@@ -34,12 +34,16 @@ function renderCellContent(content: any): string {
   return '';
 }
 
+// Add these constants at the top of the file
+const ROWS_PER_PAGE = 50; // Adjust this number as needed
+
 export default function EventSpreadsheet() {
   const [rows, setRows] = useState<EventRow[]>([]);
   const [allChecked, setAllChecked] = useState(false);
   const [isExtracting, setIsExtracting] = useState(false);
   const [activeTab, setActiveTab] = useState<'eventSpreadsheet' | 'urlExtractor'>('eventSpreadsheet');
   const [extractedUrls, setExtractedUrls] = useState<ExtractedUrl[]>([]);
+  const [currentPage, setCurrentPage] = useState(1);
 
   const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -47,11 +51,16 @@ export default function EventSpreadsheet() {
       const reader = new FileReader();
       reader.onload = (e) => {
         const content = e.target?.result as string;
+        console.log("File content:", content);
         const lines = content.split('\n').filter(line => line.trim() !== '');
+        console.log("Filtered lines:", lines);
+        
+        // Assume the first non-empty cell in each row is the URL
         const urls = lines.map(line => {
           const columns = line.split(',');
-          return columns[1]?.trim() || '';
+          return columns.find(col => col.trim() !== '') || '';
         }).filter(url => url !== '');
+        console.log("Extracted URLs:", urls);
         
         setRows(urls.map(url => ({ 
           url, 
@@ -60,6 +69,11 @@ export default function EventSpreadsheet() {
           markdown: '', 
           checked: false 
         })));
+        setCurrentPage(1);
+        console.log("Set rows:", urls.length);
+      };
+      reader.onerror = (error) => {
+        console.error("File reading error:", error);
       };
       reader.readAsText(file);
     }
@@ -87,12 +101,18 @@ export default function EventSpreadsheet() {
             const extractedData = await extractAndStoreEvent(rows[i].url);
             console.log(`Raw extracted data for ${rows[i].url}:`, JSON.stringify(extractedData, null, 2));
             
+            // Process the extracted data
+            const processedData = {
+              ...extractedData.event,
+              end_date: extractedData.event.end_date || extractedData.event.start_date
+            };
+
             setRows(prev => {
               const newRows = prev.map((row, index) => 
                 index === i ? { 
                   ...row, 
                   status: 'done' as const, 
-                  data: extractedData.event, 
+                  data: processedData, 
                   markdown: extractedData.markdown 
                 } : row
               );
@@ -105,13 +125,11 @@ export default function EventSpreadsheet() {
             setRows(prev => prev.map((row, index) => 
               index === i ? { ...row, status: 'failed' as const, data: { error: errorMessage } } : row
             ));
-            alert(`Failed to extract data for ${rows[i].url}: ${errorMessage}`);
           }
         }
       }
     } catch (error) {
       console.error('Unexpected error in extractData:', error);
-      alert('An unexpected error occurred. Please check the console for more details.');
     } finally {
       setIsExtracting(false);
     }
@@ -133,15 +151,17 @@ export default function EventSpreadsheet() {
     }
   };
 
-  const toggleAllChecked = () => {
-    setAllChecked(!allChecked);
-    setRows(prev => prev.map(row => ({ ...row, checked: !allChecked })));
+  const toggleRowChecked = (index: number) => {
+    const globalIndex = (currentPage - 1) * ROWS_PER_PAGE + index;
+    setRows(prev => prev.map((row, i) => 
+      i === globalIndex ? { ...row, checked: !row.checked } : row
+    ));
   };
 
-  const toggleRowChecked = (index: number) => {
-    setRows(prev => prev.map((row, i) => 
-      i === index ? { ...row, checked: !row.checked } : row
-    ));
+  const toggleAllChecked = () => {
+    const newAllChecked = !allChecked;
+    setAllChecked(newAllChecked);
+    setRows(prev => prev.map(row => ({ ...row, checked: newAllChecked })));
   };
 
   const clearAll = () => {
@@ -160,8 +180,18 @@ export default function EventSpreadsheet() {
       const eventsToSave = rowsToPush.map(row => ({
         ...row.data,
         url: row.url,
-        event_markdown: row.markdown
+        event_markdown: row.markdown,
+        start_date: row.data.start_date || new Date().toISOString().split('T')[0],
+        topics: Array.isArray(row.data.topics) ? row.data.topics : typeof row.data.topics === 'string' ? [row.data.topics] : null,
+        attendee_title: Array.isArray(row.data.attendee_title) ? row.data.attendee_title : typeof row.data.attendee_title === 'string' ? [row.data.attendee_title] : null,
+        sponsors: Array.isArray(row.data.sponsors) ? row.data.sponsors : typeof row.data.sponsors === 'string' ? [row.data.sponsors] : null,
+        sponsorship_options: typeof row.data.sponsorship_options === 'object' ? JSON.stringify(row.data.sponsorship_options) : row.data.sponsorship_options,
+        agenda: typeof row.data.agenda === 'object' ? JSON.stringify(row.data.agenda) : row.data.agenda,
+        audience_insights: typeof row.data.audience_insights === 'object' ? JSON.stringify(row.data.audience_insights) : row.data.audience_insights,
+        attendee_count: row.data.attendee_count?.toString()
       }));
+
+      console.log('Events to save:', eventsToSave);
 
       await saveEventsToDatabase(eventsToSave);
       
@@ -172,7 +202,7 @@ export default function EventSpreadsheet() {
       alert(`${rowsToPush.length} checked and extracted row(s) have been pushed to Supabase successfully!`);
     } catch (error) {
       console.error('Error pushing data to Supabase:', error);
-      alert('Failed to push data to Supabase. Please check the console for more details.');
+      alert('Failed to push some or all data to Supabase. Please check the console for more details.');
     }
   };
 
@@ -190,9 +220,12 @@ export default function EventSpreadsheet() {
       'Hosting Company', 'Ticket Cost', 'Contact Email'
     ];
 
-    const csvContent = [
-      headers.join(','),
-      ...extractedRows.map(row => [
+    const blobParts = [headers.join(',') + '\n'];
+
+    const batchSize = 100; // Process rows in batches
+    for (let i = 0; i < extractedRows.length; i += batchSize) {
+      const batch = extractedRows.slice(i, i + batchSize);
+      const batchContent = batch.map(row => [
         row.url,
         row.data.name,
         `"${(row.data.description || '').replace(/"/g, '""')}"`,
@@ -213,10 +246,12 @@ export default function EventSpreadsheet() {
         `"${JSON.stringify(row.data.hosting_company).replace(/"/g, '""')}"`,
         row.data.ticket_cost,
         row.data.contact_email
-      ].join(','))
-    ].join('\n');
+      ].join(',') + '\n').join('');
 
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+      blobParts.push(batchContent);
+    }
+
+    const blob = new Blob(blobParts, { type: 'text/csv;charset=utf-8;' });
     const link = document.createElement('a');
     if (link.download !== undefined) {
       const url = URL.createObjectURL(blob);
@@ -238,6 +273,7 @@ export default function EventSpreadsheet() {
       reader.onload = (e) => {
         const content = e.target?.result as string;
         const urls = content.split('\n').filter(url => url.trim() !== '');
+        console.log('Uploaded URLs:', urls); // Add this line
         setExtractedUrls(urls.map(url => ({ originalUrl: url, extractedUrl: '', status: 'Uploaded' })));
       };
       reader.readAsText(file);
@@ -245,14 +281,28 @@ export default function EventSpreadsheet() {
   };
 
   const extractUrls = async () => {
+    console.log('Starting URL extraction');
     setIsExtracting(true);
     const updatedUrls = [...extractedUrls];
+    console.log('Updated URLs:', updatedUrls);
 
     for (let i = 0; i < updatedUrls.length; i++) {
       if (updatedUrls[i].status === 'Uploaded') {
         try {
-          const extractedUrl = await extractEventUrl(updatedUrls[i].originalUrl);
-          updatedUrls[i] = { ...updatedUrls[i], extractedUrl, status: 'Extracted' };
+          const response = await fetch('/api/extractUrl', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ url: updatedUrls[i].originalUrl }),
+          });
+
+          if (!response.ok) {
+            throw new Error('Failed to extract URL');
+          }
+
+          const data = await response.json();
+          updatedUrls[i] = { ...updatedUrls[i], extractedUrl: data.extractedUrl, status: 'Extracted' };
         } catch (error) {
           console.error(`Failed to extract URL for ${updatedUrls[i].originalUrl}:`, error);
           updatedUrls[i] = { ...updatedUrls[i], extractedUrl: '', status: 'Failed' };
@@ -304,6 +354,26 @@ export default function EventSpreadsheet() {
     }
   };
 
+  // Add this function to get the current page's rows
+  const getCurrentPageRows = () => {
+    const startIndex = (currentPage - 1) * ROWS_PER_PAGE;
+    const endIndex = startIndex + ROWS_PER_PAGE;
+    return rows.slice(startIndex, endIndex);
+  };
+
+  // Add this function to handle page changes
+  const handlePageChange = (newPage: number) => {
+    setCurrentPage(newPage);
+  };
+
+  // Add this function to check if all rows are checked
+  const areAllRowsChecked = () => rows.every(row => row.checked);
+
+  // Update the useEffect hook to check if all rows are checked whenever rows change
+  useEffect(() => {
+    setAllChecked(areAllRowsChecked());
+  }, [rows]);
+
   return (
     <div className="container mx-auto p-4">
       <div className="mb-4">
@@ -349,11 +419,21 @@ export default function EventSpreadsheet() {
             Download CSV
           </button>
           
+          <div>Total rows: {rows.length}</div>
+          <div>Current page: {currentPage}</div>
+          <div>Rows per page: {ROWS_PER_PAGE}</div>
+          
           <div className="overflow-x-auto">
             <table className="min-w-full bg-white border border-gray-300 mt-4">
               <thead>
                 <tr className="bg-gray-100">
-                  <th className="border-b p-2 text-left text-gray-800">Check</th>
+                  <th className="border-b p-2 text-left text-gray-800">
+                    <input 
+                      type="checkbox" 
+                      checked={allChecked}
+                      onChange={toggleAllChecked}
+                    />
+                  </th>
                   <th className="border-b p-2 text-left text-gray-800">Status</th>
                   <th className="border-b p-2 text-left text-gray-800">URL</th>
                   <th className="border-b p-2 text-left text-gray-800">Name</th>
@@ -379,7 +459,7 @@ export default function EventSpreadsheet() {
                 </tr>
               </thead>
               <tbody>
-                {rows.map((row, index) => (
+                {getCurrentPageRows().map((row, index) => (
                   <tr key={index} className="hover:bg-gray-50">
                     <td className="border-b p-2">
                       <input 
@@ -424,6 +504,27 @@ export default function EventSpreadsheet() {
                 ))}
               </tbody>
             </table>
+          </div>
+
+          {/* Add pagination controls */}
+          <div className="mt-4 flex justify-center">
+            <button 
+              onClick={() => handlePageChange(currentPage - 1)} 
+              disabled={currentPage === 1}
+              className="bg-blue-500 text-white px-4 py-2 rounded mr-2"
+            >
+              Previous
+            </button>
+            <span className="px-4 py-2">
+              Page {currentPage} of {Math.ceil(rows.length / ROWS_PER_PAGE)}
+            </span>
+            <button 
+              onClick={() => handlePageChange(currentPage + 1)} 
+              disabled={currentPage === Math.ceil(rows.length / ROWS_PER_PAGE)}
+              className="bg-blue-500 text-white px-4 py-2 rounded ml-2"
+            >
+              Next
+            </button>
           </div>
         </div>
       ) : (
